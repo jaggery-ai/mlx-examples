@@ -123,7 +123,9 @@ def main():
         tokenizer_config["eos_token"] = args.eos_token
 
     model, tokenizer = load(
-        args.model, adapter_path=args.adapter_path, tokenizer_config=tokenizer_config
+        args.model,
+        adapter_path=args.adapter_path,
+        tokenizer_config=tokenizer_config,
     )
 
     if args.use_default_chat_template:
@@ -147,10 +149,10 @@ def main():
         model,
         tokenizer,
         prompt,
-        args.temp,
         args.max_tokens,
-        True,
+        verbose=True,
         formatter=formatter,
+        temp=args.temp,
         top_p=args.top_p,
     )
 

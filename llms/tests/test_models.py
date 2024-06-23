@@ -9,6 +9,26 @@ from mlx_lm.models.base import KVCache
 
 class TestModels(unittest.TestCase):
 
+    def test_kv_cache(self):
+        cache = KVCache(32, 4)
+
+        k = mx.ones((1, 4, 1, 32), mx.float16)
+        v = mx.ones((1, 4, 1, 32), mx.float16)
+
+        k_up, v_up = cache.update_and_fetch(k, v)
+        self.assertTrue(mx.array_equal(k_up, k))
+        self.assertTrue(mx.array_equal(v_up, v))
+        self.assertEqual(cache.offset, 1)
+
+        k = mx.ones((1, 4, cache.step, 32), mx.float16)
+        v = mx.ones((1, 4, cache.step, 32), mx.float16)
+        k_up, v_up = cache.update_and_fetch(k, v)
+
+        expected = mx.ones((1, 4, cache.step + 1, 32), mx.float16)
+        self.assertTrue(mx.array_equal(k_up, expected))
+        self.assertTrue(mx.array_equal(v_up, expected))
+        self.assertEqual(cache.offset, cache.step + 1)
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
 
         self.assertEqual(len(model.layers), num_layers)
@@ -319,6 +339,22 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gpt2(self):
+        from mlx_lm.models import gpt2
+
+        args = gpt2.ModelArgs(
+            model_type="gpt2",
+            n_ctx=1024,
+            n_embd=768,
+            n_head=12,
+            n_layer=12,
+            n_positions=1024,
+            layer_norm_epsilon=1e-5,
+            vocab_size=50256,
+        )
+        model = gpt2.Model(args)
+        self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
+
     def test_openelm(self):
         from mlx_lm.models import openelm
 
@@ -375,6 +411,23 @@ class TestModels(unittest.TestCase):
             args.model_type,
             args.vocab_size,
             len(args.ffn_multipliers),
+        )
+
+    def test_internlm2(self):
+        from mlx_lm.models import internlm2
+
+        args = internlm2.ModelArgs(
+            model_type="internlm2",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=2048,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=10000,
+        )
+        model = internlm2.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
 

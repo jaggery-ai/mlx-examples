@@ -14,8 +14,9 @@ from typing import Any, Callable, Dict, Generator, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
+from huggingface_hub.utils._errors import RepositoryNotFoundError
 from mlx.utils import tree_flatten
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 # Local imports
 from .models.base import KVCache
@@ -31,6 +32,12 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
+
+
+class ModelNotFoundError(Exception):
+    def __init__(self, message):
+        self.message = message
+        super().__init__(self.message)
 
 
 def _get_classes(config: dict):
@@ -69,20 +76,29 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
     """
     model_path = Path(path_or_hf_repo)
     if not model_path.exists():
-        model_path = Path(
-            snapshot_download(
-                repo_id=path_or_hf_repo,
-                revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                    "*.txt",
-                ],
+        try:
+            model_path = Path(
+                snapshot_download(
+                    repo_id=path_or_hf_repo,
+                    revision=revision,
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.py",
+                        "tokenizer.model",
+                        "*.tiktoken",
+                        "*.txt",
+                    ],
+                )
             )
-        )
+        except RepositoryNotFoundError:
+            raise ModelNotFoundError(
+                f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
+                "Please make sure you specified the local path or Hugging Face"
+                " repo id correctly.\nIf you are trying to access a private or"
+                " gated Hugging Face repo, make sure you are authenticated:\n"
+                "https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-login"
+            ) from None
     return model_path
 
 
@@ -120,15 +136,19 @@ def generate_step(
     logit_bias: Optional[Dict[int, float]] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
-    A generator producing text based on the given prompt from the model.
+    A generator producing token ids based on the given prompt from the model.
 
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
         temp (float): The temperature for sampling, if 0 the argmax is used.
-        repetition_penalty (float, optional): The penalty factor for repeating tokens.
-        repetition_context_size (int, optional): The number of tokens to consider for repetition penalty (default 20).
-        top_p (float, optional): Nulceus sampling, higher means model considers more less likely words
+          Default: ``0``.
+        repetition_penalty (float, optional): The penalty factor for repeating
+          tokens.
+        repetition_context_size (int, optional): The number of tokens to
+          consider for repetition penalty. Default: ``20``.
+        top_p (float, optional): Nulceus sampling, higher means model considers
+          more less likely words.
 
     Yields:
         Generator[Tuple[mx.array, mx.array]]: A generator producing
@@ -202,34 +222,71 @@ def generate_step(
         y, p = next_y, next_p
 
 
+def stream_generate(
+    model: nn.Module,
+    tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
+    prompt: str,
+    max_tokens: int = 100,
+    **kwargs,
+) -> Union[str, Generator[str, None, None]]:
+    """
+    A generator producing text based on the given prompt from the model.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The model to use for generation.
+        max_tokens (int): The ma
+        kwargs: The remaining options get passed to :func:`generate_step`.
+          See :func:`generate_step` for more details.
+
+    Yields:
+        Generator[Tuple[mx.array, mx.array]]: A generator producing text.
+    """
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+
+    prompt_tokens = mx.array(tokenizer.encode(prompt))
+    detokenizer = tokenizer.detokenizer
+
+    detokenizer.reset()
+    for (token, prob), n in zip(
+        generate_step(prompt_tokens, model, **kwargs),
+        range(max_tokens),
+    ):
+        if token == tokenizer.eos_token_id:
+            break
+        detokenizer.add_token(token)
+
+        # Yield the last segment if streaming
+        yield detokenizer.last_segment
+
+    detokenizer.finalize()
+    yield detokenizer.last_segment
+
+
 def generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: str,
-    temp: float = 0.0,
     max_tokens: int = 100,
     verbose: bool = False,
     formatter: Optional[Callable] = None,
-    repetition_penalty: Optional[float] = None,
-    repetition_context_size: Optional[int] = None,
-    top_p: float = 1.0,
-    logit_bias: Optional[Dict[int, float]] = None,
-) -> str:
+    **kwargs,
+) -> Union[str, Generator[str, None, None]]:
     """
-    Generate text from the model.
+    Generate a complete response from the model.
 
     Args:
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temp (float): The temperature for sampling (default 0).
-       max_tokens (int): The maximum number of tokens (default 100).
-       verbose (bool): If ``True``, print tokens and timing information
-           (default ``False``).
+       max_tokens (int): The maximum number of tokens. Default: ``100``.
+       verbose (bool): If ``True``, print tokens and timing information.
+           Default: ``False``.
        formatter (Optional[Callable]): A function which takes a token and a
            probability and displays it.
-       repetition_penalty (float, optional): The penalty factor for repeating tokens.
-       repetition_context_size (int, optional): The number of tokens to consider for repetition penalty.
+       kwargs: The remaining options get passed to :func:`generate_step`.
+          See :func:`generate_step` for more details.
     """
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
@@ -245,15 +302,7 @@ def generate(
     detokenizer.reset()
 
     for (token, prob), n in zip(
-        generate_step(
-            prompt_tokens,
-            model,
-            temp,
-            repetition_penalty,
-            repetition_context_size,
-            top_p,
-            logit_bias,
-        ),
+        generate_step(prompt_tokens, model, **kwargs),
         range(max_tokens),
     ):
         if n == 0:
@@ -299,7 +348,11 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
-def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
+def load_model(
+    model_path: Path,
+    lazy: bool = False,
+    model_config: dict = {},
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -308,6 +361,8 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        model_config(dict, optional): Configuration parameters for the model.
+            Defaults to an empty dictionary.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -318,6 +373,7 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
     """
 
     config = load_config(model_path)
+    config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -343,10 +399,11 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
-        class_predicate = (
-            lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
-            and f"{p}.scales" in weights
-        )
+        def class_predicate(p, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            return f"{p}.scales" in weights
+
         nn.quantize(
             model,
             **quantization,
@@ -365,6 +422,7 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
 def load(
     path_or_hf_repo: str,
     tokenizer_config={},
+    model_config={},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
 ) -> Tuple[nn.Module, TokenizerWrapper]:
@@ -374,6 +432,8 @@ def load(
     Args:
         path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
+            Defaults to an empty dictionary.
+        model_config(dict, optional): Configuration parameters specifically for the model.
             Defaults to an empty dictionary.
         adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
             to the model. Default: ``None``.
@@ -389,7 +449,7 @@ def load(
     """
     model_path = get_model_path(path_or_hf_repo)
 
-    model = load_model(model_path, lazy)
+    model = load_model(model_path, lazy, model_config)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
